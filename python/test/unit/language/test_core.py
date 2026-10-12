@@ -3335,6 +3335,39 @@ def test_argmax_argmin_tie_break_fast_with_nan(dtype, device):
     assert idx.item() == 2, f"expected 2, got {idx.item()}"
 
 
+def test_fp8_reduction_zero_tail(device):
+    if not is_cuda() or torch.cuda.get_device_capability()[0] < 9:
+        pytest.skip("requires NVIDIA Hopper or newer")
+
+    @triton.jit
+    def kernel(acts, weight, token_ids, valid_rows, output, acts_scale, weight_scale, ACTS_STRIDE: tl.constexpr,
+               WEIGHT_K_STRIDE: tl.constexpr, WEIGHT_N_STRIDE: tl.constexpr, IDS_STRIDE: tl.constexpr,
+               WIDTH: tl.constexpr, VOCAB_SIZE: tl.constexpr, K: tl.constexpr, BLOCK: tl.constexpr):
+        row = tl.program_id(0)
+        candidate = tl.program_id(1)
+        if row >= tl.load(valid_rows):
+            return
+        token = tl.load(token_ids + row * IDS_STRIDE + candidate).to(tl.int64)
+        offsets = tl.arange(0, BLOCK)
+        x = tl.load(acts + row * ACTS_STRIDE + offsets, offsets < WIDTH, other=0.0).to(tl.float32)
+        w = tl.load(weight + offsets * WEIGHT_K_STRIDE + token * WEIGHT_N_STRIDE,
+                    (offsets < WIDTH) & (token >= 0) & (token < VOCAB_SIZE), other=0.0).to(tl.float32)
+        value = tl.sum(x * w, axis=0) * (acts_scale * weight_scale)
+        value = tl.where((token >= 0) & (token < VOCAB_SIZE), value, -float("inf"))
+        tl.store(output + row * K + candidate, value)
+
+    # The large zero-filled FP8 tail exercises ptxas constant propagation.
+    rows, width, vocab, k = 4, 9216, 513, 256
+    acts = torch.zeros((rows, width), device=device, dtype=torch.uint8).view(torch.float8_e4m3fn)
+    weight = torch.zeros((vocab, width), device=device, dtype=torch.uint8).view(torch.float8_e4m3fn)
+    token_ids = torch.zeros((rows, k), device=device, dtype=torch.int32)
+    valid_rows = torch.tensor([rows], device=device, dtype=torch.int32)
+    output = torch.full((rows, k), float("nan"), device=device, dtype=torch.bfloat16)
+    kernel[(rows, k)](acts, weight, token_ids, valid_rows, output, 1.0, 1.0, ACTS_STRIDE=width, WEIGHT_K_STRIDE=1,
+                      WEIGHT_N_STRIDE=width, IDS_STRIDE=k, WIDTH=width, VOCAB_SIZE=vocab, K=k, BLOCK=16384, num_warps=4)
+    torch.testing.assert_close(output, torch.zeros_like(output), rtol=0, atol=0)
+
+
 def get_reduced_dtype(dtype_str, op):
     if op in ('argmin', 'argmax'):
         return 'int32'
